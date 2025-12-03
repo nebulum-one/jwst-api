@@ -12,13 +12,53 @@ A modern REST API for accessing James Webb Space Telescope observation data, pow
 
 ## API Endpoints
 
-- `GET /observations` - List all observations
-- `GET /observations/{id}` - Get a specific observation
-- `GET /observations/search` - Search observations
-- `GET /observations/latest` - Get recent observations
-- `GET /observations/random` - Get a random observation
-- `GET /instruments` - List JWST instruments
-- `GET /targets` - List observed targets
+### Basic Endpoints
+- `GET /` - API information and endpoint list
+- `GET /health` - Health check with database status
+- `GET /observations` - List observations with filters
+- `GET /observations/{obs_id}` - Get specific observation
+- `GET /observations/latest` - Most recent observations
+- `GET /observations/random` - Random observation
+
+### Search Endpoints
+- `GET /observations/search` - Advanced search with multiple filters
+- `GET /observations/search/coordinates` - Cone search by RA/Dec coordinates
+- `GET /observations/search/date` - Search by date range
+
+### Discovery Endpoints
+- `GET /instruments` - List all instruments with counts
+- `GET /filters` - List all filters with counts
+- `GET /targets` - List observed targets with counts
+- `GET /proposals` - List all proposals with details
+- `GET /proposals/{proposal_id}` - Get all observations for a proposal
+- `GET /statistics` - Comprehensive statistics
+
+### Example Queries
+
+**Search by coordinates (cone search):**
+```
+/observations/search/coordinates?ra=202.5&dec=47.3&radius=0.5
+```
+
+**Search by date range:**
+```
+/observations/search/date?start_date=2024-01-01&end_date=2024-12-31
+```
+
+**Search last 30 days:**
+```
+/observations/search/date?days_ago=30
+```
+
+**Advanced search:**
+```
+/observations/search?q=galaxy&instrument=NIRCAM&filter=F200W
+```
+
+**Filter by proposal:**
+```
+/observations?proposal_id=5816
+```
 
 ## Tech Stack
 
