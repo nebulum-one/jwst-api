@@ -1,0 +1,136 @@
+"""
+Job for fetching JWST observation data from NASA's MAST archive
+Run this script to populate the database with JWST observations
+"""
+
+from astroquery.mast import Observations
+from sqlalchemy.orm import Session
+from datetime import datetime
+import sys
+import os
+
+# Add parent directory to path to import our modules
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+
+from src.db.database import SessionLocal, init_db
+from src.db.models import JWSTObservation
+
+
+def fetch_jwst_observations(max_results=100):
+    """
+    Fetch JWST observations from MAST and store in database
+    
+    Args:
+        max_results: Maximum number of observations to fetch per run
+    """
+    print(f"Starting JWST data fetch... (max {max_results} observations)")
+    
+    # Initialize database
+    init_db()
+    
+    # Create database session
+    db = SessionLocal()
+    
+    try:
+        # Query MAST for JWST observations
+        print("Querying MAST archive...")
+        obs_table = Observations.query_criteria(
+            obs_collection='JWST',
+            dataproduct_type='image',
+            calib_level=[2, 3]  # Calibrated data
+        )
+        
+        print(f"Found {len(obs_table)} observations in MAST")
+        
+        # Limit results
+        obs_table = obs_table[:max_results]
+        
+        added_count = 0
+        updated_count = 0
+        
+        for row in obs_table:
+            obs_id = row['obs_id']
+            
+            # Check if observation already exists
+            existing = db.query(JWSTObservation).filter(
+                JWSTObservation.obs_id == obs_id
+            ).first()
+            
+            # Parse observation date
+            obs_date = None
+            if row.get('t_min'):
+                try:
+                    # Convert MJD to datetime
+                    from astropy.time import Time
+                    t = Time(row['t_min'], format='mjd')
+                    obs_date = t.datetime
+                except:
+                    pass
+            
+            # Prepare observation data
+            obs_data = {
+                'obs_id': obs_id,
+                'target_name': row.get('target_name', ''),
+                'ra': float(row['s_ra']) if row.get('s_ra') else None,
+                'dec': float(row['s_dec']) if row.get('s_dec') else None,
+                'instrument': row.get('instrument_name', ''),
+                'filter_name': row.get('filters', ''),
+                'observation_date': obs_date,
+                'proposal_id': row.get('proposal_id', ''),
+                'exposure_time': float(row['t_exptime']) if row.get('t_exptime') else None,
+                'description': row.get('obs_title', '')
+            }
+            
+            # Get data products (URLs for preview images and FITS files)
+            try:
+                products = Observations.get_product_list(row)
+                
+                # Find preview image
+                preview_products = [p for p in products if p['productType'] == 'PREVIEW']
+                if preview_products:
+                    obs_data['preview_url'] = preview_products[0]['dataURI']
+                
+                # Find FITS file
+                fits_products = [p for p in products if p['productType'] == 'SCIENCE']
+                if fits_products:
+                    obs_data['fits_url'] = fits_products[0]['dataURI']
+            except Exception as e:
+                print(f"Warning: Could not fetch products for {obs_id}: {e}")
+            
+            if existing:
+                # Update existing observation
+                for key, value in obs_data.items():
+                    setattr(existing, key, value)
+                existing.updated_at = datetime.utcnow()
+                updated_count += 1
+            else:
+                # Create new observation
+                new_obs = JWSTObservation(**obs_data)
+                db.add(new_obs)
+                added_count += 1
+            
+            # Commit every 10 observations to avoid losing progress
+            if (added_count + updated_count) % 10 == 0:
+                db.commit()
+                print(f"Progress: {added_count} added, {updated_count} updated")
+        
+        # Final commit
+        db.commit()
+        
+        print(f"\n✅ Fetch complete!")
+        print(f"   Added: {added_count} new observations")
+        print(f"   Updated: {updated_count} existing observations")
+        print(f"   Total in database: {db.query(JWSTObservation).count()}")
+        
+    except Exception as e:
+        print(f"❌ Error fetching data: {e}")
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    # You can adjust max_results here
+    fetch_jwst_observations(max_results=50)
+    
