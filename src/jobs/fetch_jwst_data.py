@@ -16,6 +16,13 @@ from src.db.database import SessionLocal, init_db
 from src.db.models import JWSTObservation
 
 
+def mast_uri_to_url(uri):
+    """Convert MAST URI to downloadable HTTP URL"""
+    if uri and uri.startswith('mast:'):
+        return f"https://mast.stsci.edu/api/v0.1/Download/file?uri={uri}"
+    return uri
+
+
 def fetch_jwst_observations(max_results=100):
     """
     Fetch JWST observations from MAST and store in database
@@ -67,7 +74,7 @@ def fetch_jwst_observations(max_results=100):
                 except:
                     pass
             
-            # Prepare observation data
+            # Prepare observation data with ALL fields
             obs_data = {
                 'obs_id': obs_id,
                 'target_name': row.get('target_name', ''),
@@ -78,27 +85,33 @@ def fetch_jwst_observations(max_results=100):
                 'observation_date': obs_date,
                 'proposal_id': row.get('proposal_id', ''),
                 'exposure_time': float(row['t_exptime']) if row.get('t_exptime') else None,
-                'description': row.get('obs_title', '')
+                'description': row.get('obs_title', ''),
+                # New metadata fields
+                'dataproduct_type': row.get('dataproduct_type', ''),
+                'calib_level': int(row['calib_level']) if row.get('calib_level') else None,
+                'wavelength_region': row.get('wavelength_region', ''),
+                'pi_name': row.get('proposal_pi', ''),
+                'target_classification': row.get('target_classification', '')
             }
             
             # Get data products (URLs for preview images and FITS files)
             try:
                 products = Observations.get_product_list(row)
                 
-                # Find preview image
+                # Find preview image and convert to HTTP URL
                 preview_products = [p for p in products if p['productType'] == 'PREVIEW']
                 if preview_products:
-                    obs_data['preview_url'] = preview_products[0]['dataURI']
+                    obs_data['preview_url'] = mast_uri_to_url(preview_products[0]['dataURI'])
                 
-                # Find FITS file
+                # Find FITS file and convert to HTTP URL
                 fits_products = [p for p in products if p['productType'] == 'SCIENCE']
                 if fits_products:
-                    obs_data['fits_url'] = fits_products[0]['dataURI']
+                    obs_data['fits_url'] = mast_uri_to_url(fits_products[0]['dataURI'])
             except Exception as e:
                 print(f"Warning: Could not fetch products for {obs_id}: {e}")
             
             if existing:
-                # Update existing observation
+                # Update existing observation with new data
                 for key, value in obs_data.items():
                     setattr(existing, key, value)
                 existing.updated_at = datetime.utcnow()
@@ -124,6 +137,8 @@ def fetch_jwst_observations(max_results=100):
         
     except Exception as e:
         print(f"❌ Error fetching data: {e}")
+        import traceback
+        traceback.print_exc()
         db.rollback()
         raise
     finally:
@@ -133,4 +148,3 @@ def fetch_jwst_observations(max_results=100):
 if __name__ == "__main__":
     # You can adjust max_results here
     fetch_jwst_observations(max_results=50)
-    
