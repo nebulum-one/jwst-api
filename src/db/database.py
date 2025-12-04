@@ -1,15 +1,15 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.ext.declarative import declarative_base
-import os
-from dotenv import load_dotenv
 
-load_dotenv()
+# ⬅️ IMPORTANT: use config.py instead of raw os.getenv
+from src.config import DATABASE_URL
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("❌ DATABASE_URL is missing! Check your .env file or Railway variables.")
 
-# Handle Railway's postgres:// URL format (need to convert to postgresql://)
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+# Railway sometimes uses old postgres:// format — still good to keep this guard.
+if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 engine = create_engine(DATABASE_URL, echo=False)
@@ -31,4 +31,3 @@ def init_db():
     """Initialize database tables"""
     from src.db.models import Base
     Base.metadata.create_all(bind=engine)
-    
