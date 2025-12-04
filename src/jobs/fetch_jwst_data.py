@@ -1,16 +1,20 @@
 """
-Fetch 50 PUBLIC JWST observations with valid preview + FITS URLs.
-Optimized for speed and reliable URL extraction.
+JWST Data Fetcher with Smart Monthly Batch Processing
+Automatically selects the next uncompleted month and tracks progress.
+
+Usage: python src/jobs/fetch_jwst_data.py
 """
 
 import sys
 import os
+import json
 import traceback
 from datetime import datetime, UTC
+from pathlib import Path
 
 from astroquery.mast import Observations
-from sqlalchemy.orm import Session
 from astropy.time import Time
+from sqlalchemy.orm import Session
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
@@ -19,7 +23,80 @@ from src.db.database import SessionLocal, init_db
 from src.db.models import JWSTObservation
 
 
+# Configuration
 MAX_RESULTS = 50
+PROGRESS_FILE = "progress.json"
+
+
+# -------------------------------------------------------
+# PROGRESS TRACKING
+# -------------------------------------------------------
+
+def load_progress():
+    """Load progress from JSON file"""
+    if not os.path.exists(PROGRESS_FILE):
+        return {"completed_months": [], "total_observations": 0}
+    
+    try:
+        with open(PROGRESS_FILE, 'r') as f:
+            return json.load(f)
+    except:
+        return {"completed_months": [], "total_observations": 0}
+
+
+def save_progress(progress):
+    """Save progress to JSON file"""
+    with open(PROGRESS_FILE, 'w') as f:
+        json.dump(progress, indent=2, fp=f)
+
+
+def get_all_months():
+    """Generate list of all months from Jan 2022 to current month"""
+    months = []
+    start_year = 2022
+    current = datetime.now()
+    
+    for year in range(start_year, current.year + 1):
+        for month in range(1, 13):
+            # Stop at current month
+            if year == current.year and month > current.month:
+                break
+            months.append(f"{year}-{month:02d}")
+    
+    return months
+
+
+def get_next_month_to_process(progress):
+    """Determine next month that hasn't been fetched"""
+    all_months = get_all_months()
+    completed = set(progress.get("completed_months", []))
+    
+    # Find first uncompleted month (going backwards from most recent)
+    for month in reversed(all_months):
+        if month not in completed:
+            return month
+    
+    return None
+
+
+def month_to_mjd_range(year_month):
+    """Convert YYYY-MM string to MJD date range"""
+    year, month = map(int, year_month.split('-'))
+    
+    # Start of month
+    start_dt = datetime(year, month, 1)
+    
+    # End of month (start of next month)
+    if month == 12:
+        end_dt = datetime(year + 1, 1, 1)
+    else:
+        end_dt = datetime(year, month + 1, 1)
+    
+    # Convert to MJD
+    start_mjd = Time(start_dt).mjd
+    end_mjd = Time(end_dt).mjd
+    
+    return start_mjd, end_mjd
 
 
 # -------------------------------------------------------
@@ -30,11 +107,8 @@ def clean_value(val):
     """Convert masked/nan values to None for database compatibility"""
     if val is None:
         return None
-    # Check if it's a masked value (numpy/astropy masked arrays)
-    if hasattr(val, 'mask'):
-        if val.mask:
-            return None
-    # Convert numpy strings to regular strings
+    if hasattr(val, 'mask') and val.mask:
+        return None
     if hasattr(val, 'item'):
         try:
             return val.item()
@@ -47,63 +121,41 @@ def mast_to_public_url(uri_or_path: str | None) -> str | None:
     """Convert a mast:JWST/... or filename into a public HTTPS download URL."""
     if not uri_or_path:
         return None
-
-    # Already an HTTPS URL
     if uri_or_path.startswith("http"):
         return uri_or_path
-
-    # Convert mast: URIs
     if uri_or_path.startswith("mast:"):
         return f"https://mast.stsci.edu/api/v0.1/Download/file?uri={uri_or_path}"
-
-    # Convert product filenames
     if uri_or_path.lower().endswith((".fits", ".jpg", ".jpeg", ".png")):
         return f"https://mast.stsci.edu/api/v0.1/Download/file?uri=mast:JWST/product/{uri_or_path}"
-
     return None
 
 
 def extract_preview_url(prod: dict) -> str | None:
     """Select best preview URL."""
-    # 1. Direct JPEG preview
     if prod.get("jpegURL"):
         return mast_to_public_url(prod["jpegURL"])
-
-    # 2. PNG
     if prod.get("pngURL"):
         return mast_to_public_url(prod["pngURL"])
-
-    # 3. Use dataURI if it's an image
     uri = prod.get("dataURI")
     if uri and prod.get("dataproduct_type") == "image":
         return mast_to_public_url(uri)
-
-    # 4. Fallback to productFilename
     filename = prod.get("productFilename")
     if filename:
         return mast_to_public_url(filename)
-
     return None
 
 
 def extract_fits_url(prod: dict) -> str | None:
     """Select best FITS file URL."""
-    # 1. dataURI
     uri = prod.get("dataURI")
     if uri and uri.lower().endswith(".fits"):
         return mast_to_public_url(uri)
-
-    # 2. productFilename
     filename = prod.get("productFilename")
     if filename and filename.lower().endswith(".fits"):
         return mast_to_public_url(filename)
-
-    # 3. dataURL
-    if prod.get("dataURL"):
-        url = prod["dataURL"]
-        if url.lower().endswith(".fits"):
-            return mast_to_public_url(url)
-
+    data_url = prod.get("dataURL")
+    if data_url and data_url.lower().endswith(".fits"):
+        return mast_to_public_url(data_url)
     return None
 
 
@@ -111,39 +163,50 @@ def extract_fits_url(prod: dict) -> str | None:
 # MAIN FETCH LOGIC
 # -------------------------------------------------------
 
-def fetch_public_jwst(limit=MAX_RESULTS):
-    print(f"\n🚀 Fetching up to {limit} PUBLIC JWST observations...\n")
-
-    # Fetch only public JWST observations - SIMPLE QUERY (fast!)
-    print("Querying MAST archive...")
+def fetch_month(year_month: str, limit=MAX_RESULTS):
+    """Fetch JWST observations for a specific month"""
+    
+    print(f"\n📅 Processing: {year_month}")
+    print("=" * 60)
+    
+    # Get MJD range for this month
+    start_mjd, end_mjd = month_to_mjd_range(year_month)
+    
+    # Query MAST for this specific month
+    print(f"🔍 Querying MAST for observations in {year_month}...")
     obs_table = Observations.query_criteria(
         obs_collection="JWST",
         dataproduct_type=["image"],
         calib_level=[2, 3],
-        dataRights="PUBLIC"
-    )[:limit * 3]  # Get 3x limit to scan for valid URLs
-
-    print(f"Found {len(obs_table)} observations to process.\n")
-
+        dataRights="PUBLIC",
+        t_min=[start_mjd, end_mjd]
+    )
+    
+    print(f"📊 Found {len(obs_table)} observations for {year_month}")
+    
+    if len(obs_table) == 0:
+        print(f"⚠️  No observations found for {year_month} - marking as complete")
+        return 0, 0, 0
+    
+    # Process observations
     db = SessionLocal()
     added = 0
     updated = 0
-    processed = 0
     skipped = 0
+    processed = 0
 
     for obs in obs_table:
-        if added >= limit:
-            print(f"\nReached target of {limit} new observations. Stopping.")
-            break
-
         processed += 1
-
+        
         obsid = clean_value(obs.get("obsid") or obs.get("obs_id"))
         if not obsid:
             skipped += 1
             continue
 
-        # Retrieve product list for this observation
+        # Check if exists
+        existing = db.query(JWSTObservation).filter_by(obs_id=obsid).first()
+
+        # Get product list
         try:
             products = Observations.get_product_list(obs)
         except:
@@ -154,26 +217,20 @@ def fetch_public_jwst(limit=MAX_RESULTS):
             skipped += 1
             continue
 
+        # Extract URLs
         preview = None
         fits = None
-
-        # Scan for best preview + FITS URLs
         for prod in products:
             if not preview:
                 preview = extract_preview_url(prod)
             if not fits:
                 fits = extract_fits_url(prod)
-
             if preview and fits:
                 break
 
-        # Must have at least preview or fits URL
         if not preview and not fits:
             skipped += 1
             continue
-
-        # Check if exists
-        existing = db.query(JWSTObservation).filter_by(obs_id=obsid).first()
 
         # Parse date
         obs_date = None
@@ -184,7 +241,7 @@ def fetch_public_jwst(limit=MAX_RESULTS):
             except:
                 pass
 
-        # Prepare metadata (CLEAN all values to avoid masked constants)
+        # Prepare metadata
         metadata = {
             "obs_id": obsid,
             "target_name": clean_value(obs.get("target_name")),
@@ -215,31 +272,96 @@ def fetch_public_jwst(limit=MAX_RESULTS):
             db.add(obj)
             added += 1
 
-        if (added + updated) % 10 == 0:
+        # Progress updates
+        if (added + updated) % 25 == 0:
             db.commit()
-            print(f"Progress: {added} added, {updated} updated, {skipped} skipped (processed {processed})")
+            print(f"  Progress: {added} added, {updated} updated, {skipped} skipped ({processed}/{len(obs_table)})")
 
     db.commit()
     db.close()
 
-    print("\n✅ Fetch complete!")
-    print(f"   Added: {added}")
-    print(f"   Updated: {updated}")
-    print(f"   Skipped: {skipped}")
-    print(f"   Total processed: {processed}")
+    return added, updated, skipped
+
+
+# -------------------------------------------------------
+# MAIN EXECUTION
+# -------------------------------------------------------
+
+def main():
+    """Main execution with smart month selection"""
+    
+    print("\n" + "=" * 60)
+    print("🔭 JWST DATA FETCHER - Smart Monthly Batch Processing")
+    print("=" * 60)
+    
+    # Initialize database
+    init_db()
+    
+    # Load progress
+    progress = load_progress()
+    
+    # Show current progress
+    all_months = get_all_months()
+    completed_count = len(progress.get("completed_months", []))
+    total_count = len(all_months)
+    
+    print(f"\n📊 Current Progress: {completed_count}/{total_count} months completed ({completed_count/total_count*100:.1f}%)")
+    
+    # Find next month to process
+    next_month = get_next_month_to_process(progress)
+    
+    if not next_month:
+        print("\n🎉 ALL MONTHS COMPLETED! Your database is fully backfilled!")
+        print(f"📚 Total observations: {progress.get('total_observations', 0)}")
+        return
+    
+    print(f"📅 Next month to process: {next_month}")
     print()
-
-
-# -------------------------------------------------------
-# ENTRY POINT
-# -------------------------------------------------------
-
-if __name__ == "__main__":
+    
     try:
-        init_db()
-        fetch_public_jwst()
+        # Fetch this month's data
+        added, updated, skipped = fetch_month(next_month)
+        
+        # Update progress
+        if next_month not in progress["completed_months"]:
+            progress["completed_months"].append(next_month)
+        
+        # Get total observation count
+        db = SessionLocal()
+        total_obs = db.query(JWSTObservation).count()
+        db.close()
+        
+        progress["total_observations"] = total_obs
+        progress["last_run"] = datetime.now(UTC).isoformat()
+        
+        save_progress(progress)
+        
+        # Summary
+        print("\n" + "=" * 60)
+        print(f"✅ {next_month} COMPLETE!")
+        print("=" * 60)
+        print(f"   Added: {added} new observations")
+        print(f"   Updated: {updated} existing observations")
+        print(f"   Skipped: {skipped} (no valid URLs)")
+        print(f"   Total in database: {total_obs}")
+        print()
+        print(f"📊 Overall Progress: {len(progress['completed_months'])}/{len(all_months)} months ({len(progress['completed_months'])/len(all_months)*100:.1f}%)")
+        
+        # Show next month
+        next_next_month = get_next_month_to_process(progress)
+        if next_next_month:
+            print(f"📅 Next run will process: {next_next_month}")
+            print("\n💡 Run the script again to continue!")
+        else:
+            print("\n🎉 ALL DONE! Database fully backfilled!")
+        
+        print("=" * 60 + "\n")
+        
     except Exception as e:
-        print("❌ ERROR:")
+        print(f"\n❌ ERROR processing {next_month}:")
         traceback.print_exc()
         sys.exit(1)
 
+
+if __name__ == "__main__":
+    main()
