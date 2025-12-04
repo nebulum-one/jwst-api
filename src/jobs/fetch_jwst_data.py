@@ -4,6 +4,7 @@ Optimized for speed and reliable URL extraction.
 """
 
 import sys
+import os
 import traceback
 from datetime import datetime, UTC
 
@@ -241,3 +242,4 @@ if __name__ == "__main__":
         print("❌ ERROR:")
         traceback.print_exc()
         sys.exit(1)
+
