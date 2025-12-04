@@ -15,7 +15,7 @@ init_db()
 
 app = FastAPI(
     title="JWST API",
-    description="REST API for accessing James Webb Space Telescope observation data",
+    description="REST API for accessing James Webb Space Telescope observation data (images & spectra)",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
@@ -37,11 +37,13 @@ async def root():
     return {
         "name": "JWST API",
         "version": "1.0.0",
-        "description": "REST API for James Webb Space Telescope observations",
+        "description": "REST API for James Webb Space Telescope observations (images & spectra)",
         "documentation": "/docs",
         "endpoints": {
             "observations": "/observations",
             "observation_by_id": "/observations/{obs_id}",
+            "images_only": "/observations/images",
+            "spectra_only": "/observations/spectra",
             "search": "/observations/search",
             "search_by_coordinates": "/observations/search/coordinates",
             "search_by_date": "/observations/search/date",
@@ -49,6 +51,7 @@ async def root():
             "random": "/observations/random",
             "instruments": "/instruments",
             "filters": "/filters",
+            "gratings": "/gratings",
             "targets": "/targets",
             "proposals": "/proposals",
             "statistics": "/statistics"
@@ -93,6 +96,107 @@ async def get_observations(
             "target": target,
             "filter": filter,
             "proposal_id": proposal_id
+        },
+        "results": [obs.to_dict() for obs in observations]
+    }
+
+
+@app.get("/observations/images")
+async def get_images(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=100),
+    instrument: Optional[str] = None,
+    filter: Optional[str] = None,
+    target: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """
+    Get imaging observations only (excludes spectra).
+    
+    Example: /observations/images?instrument=NIRCAM&filter=F200W
+    """
+    query = db.query(JWSTObservation).filter(
+        JWSTObservation.dataproduct_type == "image"
+    )
+    
+    if instrument:
+        query = query.filter(JWSTObservation.instrument.ilike(f"%{instrument}%"))
+    
+    if filter:
+        query = query.filter(JWSTObservation.filter_name.ilike(f"%{filter}%"))
+    
+    if target:
+        query = query.filter(JWSTObservation.target_name.ilike(f"%{target}%"))
+    
+    total = query.count()
+    observations = query.order_by(desc(JWSTObservation.observation_date)).offset(skip).limit(limit).all()
+    
+    return {
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "filters_applied": {
+            "instrument": instrument,
+            "filter": filter,
+            "target": target
+        },
+        "results": [obs.to_dict() for obs in observations]
+    }
+
+
+@app.get("/observations/spectra")
+async def get_spectra(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=100),
+    instrument: Optional[str] = None,
+    grating: Optional[str] = None,
+    min_resolution: Optional[float] = None,
+    min_wavelength: Optional[float] = Query(None, description="Minimum wavelength in microns"),
+    max_wavelength: Optional[float] = Query(None, description="Maximum wavelength in microns"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get spectroscopic observations with spectrum-specific filters.
+    
+    Examples:
+    - /observations/spectra?instrument=NIRSPEC
+    - /observations/spectra?grating=G395H&min_resolution=1000
+    - /observations/spectra?min_wavelength=2.0&max_wavelength=5.0
+    """
+    query = db.query(JWSTObservation).filter(
+        JWSTObservation.dataproduct_type == "spectrum"
+    )
+    
+    if instrument:
+        query = query.filter(JWSTObservation.instrument.ilike(f"%{instrument}%"))
+    
+    if grating:
+        query = query.filter(JWSTObservation.grating.ilike(f"%{grating}%"))
+    
+    if min_resolution:
+        query = query.filter(JWSTObservation.spectral_resolution >= min_resolution)
+    
+    if min_wavelength:
+        query = query.filter(JWSTObservation.wavelength_min >= min_wavelength)
+    
+    if max_wavelength:
+        query = query.filter(JWSTObservation.wavelength_max <= max_wavelength)
+    
+    total = query.count()
+    observations = query.order_by(desc(JWSTObservation.observation_date)).offset(skip).limit(limit).all()
+    
+    return {
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "filters_applied": {
+            "instrument": instrument,
+            "grating": grating,
+            "min_resolution": min_resolution,
+            "wavelength_range": {
+                "min": min_wavelength,
+                "max": max_wavelength
+            } if min_wavelength or max_wavelength else None
         },
         "results": [obs.to_dict() for obs in observations]
     }
@@ -345,6 +449,30 @@ async def get_filters(
     }
 
 
+@app.get("/gratings")
+async def get_gratings(
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db)
+):
+    """Get list of all gratings/dispersers used in spectroscopic observations"""
+    gratings = db.query(
+        JWSTObservation.grating,
+        func.count(JWSTObservation.id).label('count')
+    ).filter(
+        JWSTObservation.grating.isnot(None),
+        JWSTObservation.grating != '',
+        JWSTObservation.dataproduct_type == 'spectrum'
+    ).group_by(JWSTObservation.grating).order_by(desc('count')).limit(limit).all()
+    
+    return {
+        "total": len(gratings),
+        "gratings": [
+            {"name": grating[0], "observation_count": grating[1]} 
+            for grating in gratings
+        ]
+    }
+
+
 @app.get("/targets")
 async def get_targets(
     limit: int = Query(100, ge=1, le=500),
@@ -453,6 +581,14 @@ async def get_statistics(db: Session = Depends(get_db)):
         JWSTObservation.instrument.isnot(None)
     ).group_by(JWSTObservation.instrument).all()
     
+    # Get data product type breakdown (images vs spectra)
+    dataproduct_stats = db.query(
+        JWSTObservation.dataproduct_type,
+        func.count(JWSTObservation.id).label('count')
+    ).filter(
+        JWSTObservation.dataproduct_type.isnot(None)
+    ).group_by(JWSTObservation.dataproduct_type).all()
+    
     # Get most observed targets
     top_targets = db.query(
         JWSTObservation.target_name,
@@ -470,6 +606,16 @@ async def get_statistics(db: Session = Depends(get_db)):
         JWSTObservation.filter_name.isnot(None),
         JWSTObservation.filter_name != ''
     ).group_by(JWSTObservation.filter_name).order_by(desc('count')).limit(10).all()
+    
+    # Get top gratings for spectra
+    top_gratings = db.query(
+        JWSTObservation.grating,
+        func.count(JWSTObservation.id).label('count')
+    ).filter(
+        JWSTObservation.grating.isnot(None),
+        JWSTObservation.grating != '',
+        JWSTObservation.dataproduct_type == 'spectrum'
+    ).group_by(JWSTObservation.grating).order_by(desc('count')).limit(10).all()
     
     # Get total exposure time
     total_exposure = db.query(func.sum(JWSTObservation.exposure_time)).scalar() or 0
@@ -490,6 +636,12 @@ async def get_statistics(db: Session = Depends(get_db)):
                 "latest": date_range[1].isoformat() if date_range[1] else None
             }
         },
+        "data_products": {
+            "breakdown": [
+                {"type": dp[0], "count": dp[1], "percentage": round(dp[1] / total_observations * 100, 1)}
+                for dp in dataproduct_stats
+            ]
+        },
         "instruments": {
             "total_instruments": len(instrument_stats),
             "breakdown": [
@@ -504,7 +656,11 @@ async def get_statistics(db: Session = Depends(get_db)):
         "top_filters": [
             {"name": filt[0], "observation_count": filt[1]}
             for filt in top_filters
-        ]
+        ],
+        "top_gratings": [
+            {"name": grating[0], "observation_count": grating[1]}
+            for grating in top_gratings
+        ] if top_gratings else []
     }
 
 
