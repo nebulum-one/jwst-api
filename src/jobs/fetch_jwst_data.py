@@ -112,12 +112,11 @@ def fetch_jwst_observations(max_results=MAX_RESULTS):
         SCAN_LIMIT = max_results * 3
         
         print(f"Querying MAST archive (scanning up to {SCAN_LIMIT} entries)...")
-        obs_table = Observations.query_criteria(
-            obs_collection="JWST",
-            dataproduct_type=["image"],  # Focus on images (most useful)
-            calib_level=[2, 3],          # Calibrated data only
-            dataRights="PUBLIC"          # Only public data (no access denied errors)
-        )
+obs_table = Observations.query_criteria(
+    obs_collection="JWST",
+    dataproduct_type=["image"],
+    calib_level=[3]  # Only fully processed data
+)[:150]  # Take first 150 only
         
         print(f"Found {len(obs_table)} public observations in MAST")
         
