@@ -44,7 +44,8 @@ def fetch_jwst_observations(max_results=100):
         obs_table = Observations.query_criteria(
             obs_collection='JWST',
             dataproduct_type='image',
-            calib_level=[2, 3]  # Calibrated data
+            calib_level=[2, 3],  # Calibrated data
+            dataRights='PUBLIC'  # Only public data (no access denied errors)
         )
         
         print(f"Found {len(obs_table)} observations in MAST")
@@ -74,7 +75,7 @@ def fetch_jwst_observations(max_results=100):
                 except:
                     pass
             
-            # Prepare observation data with ALL fields
+            # Prepare observation data with ALL fields (using correct MAST field names)
             obs_data = {
                 'obs_id': obs_id,
                 'target_name': row.get('target_name', ''),
@@ -86,29 +87,19 @@ def fetch_jwst_observations(max_results=100):
                 'proposal_id': row.get('proposal_id', ''),
                 'exposure_time': float(row['t_exptime']) if row.get('t_exptime') else None,
                 'description': row.get('obs_title', ''),
-                # New metadata fields
+                # New metadata fields (using CORRECT MAST field names)
                 'dataproduct_type': row.get('dataproduct_type', ''),
                 'calib_level': int(row['calib_level']) if row.get('calib_level') else None,
                 'wavelength_region': row.get('wavelength_region', ''),
-                'pi_name': row.get('proposal_pi', ''),
-                'target_classification': row.get('target_classification', '')
+                'pi_name': row.get('proposal_pi', ''),  # MAST calls it 'proposal_pi'
+                'target_classification': row.get('target_classification', ''),
+                # Get URLs directly from MAST (they provide jpegURL and dataURL)
+                'preview_url': row.get('jpegURL', ''),
+                'fits_url': row.get('dataURL', '')
             }
             
-            # Get data products (URLs for preview images and FITS files)
-            try:
-                products = Observations.get_product_list(row)
-                
-                # Find preview image and convert to HTTP URL
-                preview_products = [p for p in products if p['productType'] == 'PREVIEW']
-                if preview_products:
-                    obs_data['preview_url'] = mast_uri_to_url(preview_products[0]['dataURI'])
-                
-                # Find FITS file and convert to HTTP URL
-                fits_products = [p for p in products if p['productType'] == 'SCIENCE']
-                if fits_products:
-                    obs_data['fits_url'] = mast_uri_to_url(fits_products[0]['dataURI'])
-            except Exception as e:
-                print(f"Warning: Could not fetch products for {obs_id}: {e}")
+            # URLs are now directly from MAST metadata (jpegURL and dataURL)
+            # No need to fetch product list separately anymore!
             
             if existing:
                 # Update existing observation with new data
