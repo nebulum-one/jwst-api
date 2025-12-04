@@ -11,8 +11,6 @@ import json
 import traceback
 from datetime import datetime, UTC
 from pathlib import Path
-import time
-from requests.exceptions import HTTPError, ConnectionError, Timeout
 
 from astroquery.mast import Observations
 from astropy.time import Time
@@ -166,7 +164,7 @@ def extract_fits_url(prod: dict) -> str | None:
 # -------------------------------------------------------
 
 def fetch_month(year_month: str, limit=MAX_RESULTS):
-    """Fetch JWST observations for a specific month with rate limiting and safer network handling"""
+    """Fetch JWST observations for a specific month"""
     
     print(f"\n📅 Processing: {year_month}")
     print("=" * 60)
@@ -197,6 +195,16 @@ def fetch_month(year_month: str, limit=MAX_RESULTS):
     skipped = 0
     processed = 0
 
+    # -------------------------------
+    # Load existing obs_ids to skip updates
+    existing_obs_ids = set(
+        r[0] for r in db.query(JWSTObservation.obs_id)
+                     .filter(JWSTObservation.obs_id.in_(
+                         [clean_value(obs.get("obsid") or obs.get("obs_id")) for obs in obs_table]
+                     ))
+                     .all()
+    )
+
     for obs in obs_table:
         processed += 1
         
@@ -205,19 +213,15 @@ def fetch_month(year_month: str, limit=MAX_RESULTS):
             skipped += 1
             continue
 
-        # Check if exists
-        existing = db.query(JWSTObservation).filter_by(obs_id=obsid).first()
-
-        # Get product list safely with rate limiting
-        try:
-            products = Observations.get_product_list(obs)
-            time.sleep(0.25)  # small delay to avoid hitting MAST rate limits
-        except (HTTPError, ConnectionError, Timeout) as e:
-            print(f"⚠️ Network error for obs {obsid}: {e} - skipping")
+        # Skip if already exists
+        if obsid in existing_obs_ids:
             skipped += 1
             continue
-        except Exception as e:
-            print(f"⚠️ Unexpected error for obs {obsid}: {e} - skipping")
+
+        # Get product list
+        try:
+            products = Observations.get_product_list(obs)
+        except:
             skipped += 1
             continue
 
@@ -271,28 +275,20 @@ def fetch_month(year_month: str, limit=MAX_RESULTS):
             "updated_at": datetime.now(UTC),
         }
 
-        if existing:
-            for k, v in metadata.items():
-                setattr(existing, k, v)
-            updated += 1
-        else:
-            obj = JWSTObservation(**metadata)
-            db.add(obj)
-            added += 1
+        # Add new observation
+        obj = JWSTObservation(**metadata)
+        db.add(obj)
+        added += 1
 
-        # Progress updates
-        if (added + updated) % 25 == 0:
+        # Commit in batches for progress
+        if added % 25 == 0:
             db.commit()
-            print(f"  Progress: {added} added, {updated} updated, {skipped} skipped ({processed}/{len(obs_table)})")
-            # Save mid-month progress to prevent loss
-            progress = load_progress()
-            progress["total_observations"] = db.query(JWSTObservation).count()
-            save_progress(progress)
+            print(f"  Progress: {added} added, {skipped} skipped ({processed}/{len(obs_table)})")
 
     db.commit()
     db.close()
 
-    return added, updated, skipped
+    return added, 0, skipped
 
 
 # -------------------------------------------------------
@@ -354,7 +350,7 @@ def main():
         print("=" * 60)
         print(f"   Added: {added} new observations")
         print(f"   Updated: {updated} existing observations")
-        print(f"   Skipped: {skipped} (no valid URLs)")
+        print(f"   Skipped: {skipped} (already in database or no valid URLs)")
         print(f"   Total in database: {total_obs}")
         print()
         print(f"📊 Overall Progress: {len(progress['completed_months'])}/{len(all_months)} months ({len(progress['completed_months'])/len(all_months)*100:.1f}%)")
@@ -377,3 +373,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
