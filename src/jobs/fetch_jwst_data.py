@@ -1,6 +1,6 @@
 """
 JWST Data Fetcher with Smart Monthly Batch Processing
-Supports both IMAGE and SPECTRUM data with appropriate metadata.
+Automatically selects the next uncompleted month and tracks progress.
 
 Usage: python src/jobs/fetch_jwst_data.py
 """
@@ -159,46 +159,12 @@ def extract_fits_url(prod: dict) -> str | None:
     return None
 
 
-def extract_spectrum_metadata(obs: dict) -> dict:
-    """
-    Extract spectrum-specific metadata from observation.
-    Returns dict with spectral resolution, wavelength range, grating, etc.
-    """
-    spectrum_meta = {}
-    
-    # Spectral resolution (if available)
-    if obs.get('em_res_power'):
-        spectrum_meta['spectral_resolution'] = float(obs['em_res_power'])
-    
-    # Wavelength range (convert from meters to microns if needed)
-    if obs.get('em_min'):
-        # MAST stores wavelengths in meters, convert to microns
-        wl_min = float(obs['em_min'])
-        spectrum_meta['wavelength_min'] = wl_min * 1e6 if wl_min < 0.001 else wl_min
-    
-    if obs.get('em_max'):
-        wl_max = float(obs['em_max'])
-        spectrum_meta['wavelength_max'] = wl_max * 1e6 if wl_max < 0.001 else wl_max
-    
-    # Grating/disperser information (often in filters field for spectra)
-    filters = clean_value(obs.get("filters"))
-    if filters:
-        # JWST gratings: PRISM, G140M, G235M, G395M, G140H, G235H, G395H, etc.
-        grating_keywords = ['PRISM', 'G140', 'G235', 'G395', 'G150', 'G235']
-        for keyword in grating_keywords:
-            if keyword in filters.upper():
-                spectrum_meta['grating'] = filters
-                break
-    
-    return spectrum_meta
-
-
 # -------------------------------------------------------
 # MAIN FETCH LOGIC
 # -------------------------------------------------------
 
 def fetch_month(year_month: str, limit=MAX_RESULTS):
-    """Fetch JWST observations (images AND spectra) for a specific month"""
+    """Fetch JWST observations for a specific month"""
     
     print(f"\n📅 Processing: {year_month}")
     print("=" * 60)
@@ -206,11 +172,11 @@ def fetch_month(year_month: str, limit=MAX_RESULTS):
     # Get MJD range for this month
     start_mjd, end_mjd = month_to_mjd_range(year_month)
     
-    # Query MAST for this specific month - NOW INCLUDING SPECTRA
+    # Query MAST for this specific month
     print(f"🔍 Querying MAST for observations in {year_month}...")
     obs_table = Observations.query_criteria(
         obs_collection="JWST",
-        dataproduct_type=["image", "spectrum"],  # ← NOW INCLUDES SPECTRA!
+        dataproduct_type=["image"],
         calib_level=[2, 3],
         dataRights="PUBLIC",
         t_min=[start_mjd, end_mjd]
@@ -222,27 +188,12 @@ def fetch_month(year_month: str, limit=MAX_RESULTS):
         print(f"⚠️  No observations found for {year_month} - marking as complete")
         return 0, 0, 0
     
-    # Count by type
-    image_count = sum(1 for obs in obs_table if obs.get('dataproduct_type') == 'image')
-    spectrum_count = sum(1 for obs in obs_table if obs.get('dataproduct_type') == 'spectrum')
-    print(f"   📷 Images: {image_count}")
-    print(f"   📊 Spectra: {spectrum_count}")
-    
     # Process observations
     db = SessionLocal()
     added = 0
     updated = 0
     skipped = 0
     processed = 0
-
-    # Load existing obs_ids to skip updates
-    existing_obs_ids = set(
-        r[0] for r in db.query(JWSTObservation.obs_id)
-                     .filter(JWSTObservation.obs_id.in_(
-                         [clean_value(obs.get("obsid") or obs.get("obs_id")) for obs in obs_table]
-                     ))
-                     .all()
-    )
 
     for obs in obs_table:
         processed += 1
@@ -252,10 +203,8 @@ def fetch_month(year_month: str, limit=MAX_RESULTS):
             skipped += 1
             continue
 
-        # Skip if already exists
-        if obsid in existing_obs_ids:
-            skipped += 1
-            continue
+        # Check if exists
+        existing = db.query(JWSTObservation).filter_by(obs_id=obsid).first()
 
         # Get product list
         try:
@@ -292,10 +241,7 @@ def fetch_month(year_month: str, limit=MAX_RESULTS):
             except:
                 pass
 
-        # Get data product type
-        dataproduct_type = clean_value(obs.get("dataproduct_type"))
-
-        # Prepare base metadata
+        # Prepare metadata
         metadata = {
             "obs_id": obsid,
             "target_name": clean_value(obs.get("target_name")),
@@ -309,7 +255,7 @@ def fetch_month(year_month: str, limit=MAX_RESULTS):
             "description": clean_value(obs.get("obs_title")),
             "proposal_id": clean_value(str(obs.get("proposal_id")) if obs.get("proposal_id") else None),
             "exposure_time": float(obs.get("t_exptime")) if obs.get("t_exptime") else None,
-            "dataproduct_type": dataproduct_type,
+            "dataproduct_type": clean_value(obs.get("dataproduct_type")),
             "calib_level": int(obs.get("calib_level")) if obs.get("calib_level") else None,
             "wavelength_region": clean_value(obs.get("wavelength_region")),
             "pi_name": clean_value(obs.get("proposal_pi")),
@@ -317,32 +263,24 @@ def fetch_month(year_month: str, limit=MAX_RESULTS):
             "updated_at": datetime.now(UTC),
         }
 
-        # Add spectrum-specific metadata if this is a spectrum
-        if dataproduct_type == "spectrum":
-            spectrum_meta = extract_spectrum_metadata(obs)
-            metadata.update({
-                "spectral_resolution": spectrum_meta.get("spectral_resolution"),
-                "wavelength_min": spectrum_meta.get("wavelength_min"),
-                "wavelength_max": spectrum_meta.get("wavelength_max"),
-                "grating": spectrum_meta.get("grating"),
-                "dispersion_axis": None,  # Not readily available in MAST metadata
-                "slit_width": None,  # Not readily available in MAST metadata
-            })
+        if existing:
+            for k, v in metadata.items():
+                setattr(existing, k, v)
+            updated += 1
+        else:
+            obj = JWSTObservation(**metadata)
+            db.add(obj)
+            added += 1
 
-        # Add new observation
-        obj = JWSTObservation(**metadata)
-        db.add(obj)
-        added += 1
-
-        # Commit in batches for progress
-        if added % 25 == 0:
+        # Progress updates
+        if (added + updated) % 25 == 0:
             db.commit()
-            print(f"  Progress: {added} added, {skipped} skipped ({processed}/{len(obs_table)})")
+            print(f"  Progress: {added} added, {updated} updated, {skipped} skipped ({processed}/{len(obs_table)})")
 
     db.commit()
     db.close()
 
-    return added, 0, skipped
+    return added, updated, skipped
 
 
 # -------------------------------------------------------
@@ -353,7 +291,7 @@ def main():
     """Main execution with smart month selection"""
     
     print("\n" + "=" * 60)
-    print("🔭 JWST DATA FETCHER - Images & Spectra")
+    print("🔭 JWST DATA FETCHER - Smart Monthly Batch Processing")
     print("=" * 60)
     
     # Initialize database
@@ -404,7 +342,7 @@ def main():
         print("=" * 60)
         print(f"   Added: {added} new observations")
         print(f"   Updated: {updated} existing observations")
-        print(f"   Skipped: {skipped} (already in database or no valid URLs)")
+        print(f"   Skipped: {skipped} (no valid URLs)")
         print(f"   Total in database: {total_obs}")
         print()
         print(f"📊 Overall Progress: {len(progress['completed_months'])}/{len(all_months)} months ({len(progress['completed_months'])/len(all_months)*100:.1f}%)")
