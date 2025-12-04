@@ -1,34 +1,49 @@
 """
-Job for fetching JWST observation data from NASA's MAST archive
-Run this script to populate the database with JWST observations
-
-Usage: python src/jobs/fetch_jwst_data.py
+Fetch 50 PUBLIC JWST observations with valid preview + FITS URLs.
+Optimized for speed and reliable URL extraction.
 """
 
-from astroquery.mast import Observations
-from astropy.time import Time
-from datetime import datetime, UTC
 import sys
-import os
 import traceback
+from datetime import datetime, UTC
 
-# Add parent directory to path to import our modules
+from astroquery.mast import Observations
+from sqlalchemy.orm import Session
+from astropy.time import Time
+
+# Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from src.db.database import SessionLocal, init_db
 from src.db.models import JWSTObservation
 
 
-# Configuration
-MAX_RESULTS = 50  # How many observations to add/update per run
+MAX_RESULTS = 50
 
 
 # -------------------------------------------------------
-# URL CONVERSION HELPERS
+# HELPER FUNCTIONS
 # -------------------------------------------------------
+
+def clean_value(val):
+    """Convert masked/nan values to None for database compatibility"""
+    if val is None:
+        return None
+    # Check if it's a masked value (numpy/astropy masked arrays)
+    if hasattr(val, 'mask'):
+        if val.mask:
+            return None
+    # Convert numpy strings to regular strings
+    if hasattr(val, 'item'):
+        try:
+            return val.item()
+        except:
+            pass
+    return val
+
 
 def mast_to_public_url(uri_or_path: str | None) -> str | None:
-    """Convert a mast:JWST/... URI or filename into a public HTTPS download URL."""
+    """Convert a mast:JWST/... or filename into a public HTTPS download URL."""
     if not uri_or_path:
         return None
 
@@ -40,7 +55,7 @@ def mast_to_public_url(uri_or_path: str | None) -> str | None:
     if uri_or_path.startswith("mast:"):
         return f"https://mast.stsci.edu/api/v0.1/Download/file?uri={uri_or_path}"
 
-    # Convert product filenames (e.g., jw01234...fits)
+    # Convert product filenames
     if uri_or_path.lower().endswith((".fits", ".jpg", ".jpeg", ".png")):
         return f"https://mast.stsci.edu/api/v0.1/Download/file?uri=mast:JWST/product/{uri_or_path}"
 
@@ -48,41 +63,45 @@ def mast_to_public_url(uri_or_path: str | None) -> str | None:
 
 
 def extract_preview_url(prod: dict) -> str | None:
-    """Extract the best preview image URL from a product."""
-    # Priority: jpegURL > pngURL > dataURI (if image) > productFilename
-    
+    """Select best preview URL."""
+    # 1. Direct JPEG preview
     if prod.get("jpegURL"):
         return mast_to_public_url(prod["jpegURL"])
-    
+
+    # 2. PNG
     if prod.get("pngURL"):
         return mast_to_public_url(prod["pngURL"])
-    
+
+    # 3. Use dataURI if it's an image
     uri = prod.get("dataURI")
     if uri and prod.get("dataproduct_type") == "image":
         return mast_to_public_url(uri)
-    
+
+    # 4. Fallback to productFilename
     filename = prod.get("productFilename")
-    if filename and filename.lower().endswith((".jpg", ".jpeg", ".png")):
+    if filename:
         return mast_to_public_url(filename)
 
     return None
 
 
 def extract_fits_url(prod: dict) -> str | None:
-    """Extract the best FITS file URL from a product."""
-    # Priority: dataURI > productFilename > dataURL
-    
+    """Select best FITS file URL."""
+    # 1. dataURI
     uri = prod.get("dataURI")
     if uri and uri.lower().endswith(".fits"):
         return mast_to_public_url(uri)
-    
+
+    # 2. productFilename
     filename = prod.get("productFilename")
     if filename and filename.lower().endswith(".fits"):
         return mast_to_public_url(filename)
-    
-    data_url = prod.get("dataURL")
-    if data_url and data_url.lower().endswith(".fits"):
-        return mast_to_public_url(data_url)
+
+    # 3. dataURL
+    if prod.get("dataURL"):
+        url = prod["dataURL"]
+        if url.lower().endswith(".fits"):
+            return mast_to_public_url(url)
 
     return None
 
@@ -91,172 +110,134 @@ def extract_fits_url(prod: dict) -> str | None:
 # MAIN FETCH LOGIC
 # -------------------------------------------------------
 
-def fetch_jwst_observations(max_results=MAX_RESULTS):
-    """
-    Fetch JWST observations from MAST and store in database
-    
-    Args:
-        max_results: Maximum number of observations to add per run
-    """
-    print(f"\n🚀 Starting JWST data fetch (max {max_results} observations)...\n")
-    
-    # Initialize database
-    init_db()
-    
-    # Create database session
-    db = SessionLocal()
-    
-    try:
-        # Query MAST for PUBLIC JWST observations
-        # Limit to 3x max_results to scan through for valid URLs
-        SCAN_LIMIT = max_results * 3
-        
-        print(f"Querying MAST archive (scanning up to {SCAN_LIMIT} entries)...")
-        obs_table = Observations.query_criteria(
-            obs_collection="JWST",
-            dataproduct_type=["image"],  # Focus on images (most useful)
-            calib_level=[2, 3],          # Calibrated data only
-            dataRights="PUBLIC"          # Only public data (no access denied errors)
-        )
-        
-        print(f"Found {len(obs_table)} public observations in MAST")
-        
-        # Limit how many we scan through
-        obs_table = obs_table[:SCAN_LIMIT]
-        print(f"Processing first {len(obs_table)} observations...\n")
-        
-        added_count = 0
-        updated_count = 0
-        processed_count = 0
-        skipped_count = 0
-        
-        for row in obs_table:
-            # Stop if we've added enough observations
-            if added_count >= max_results:
-                print(f"\nReached target of {max_results} new observations. Stopping.")
-                break
-            
-            processed_count += 1
-            
-            obs_id = row.get('obs_id')
-            if not obs_id:
-                skipped_count += 1
-                continue
-            
-            # Check if observation already exists
-            existing = db.query(JWSTObservation).filter(
-                JWSTObservation.obs_id == obs_id
-            ).first()
-            
-            # Parse observation date from MJD
-            obs_date = None
-            if row.get('t_min'):
-                try:
-                    t = Time(row['t_min'], format='mjd')
-                    obs_date = t.datetime
-                except:
-                    pass
-            
-            # Get product list to extract URLs
-            preview_url = None
-            fits_url = None
-            
-            try:
-                products = Observations.get_product_list(row)
-                
-                # Scan products for best preview and FITS URLs
-                for prod in products:
-                    if not preview_url:
-                        preview_url = extract_preview_url(prod)
-                    if not fits_url:
-                        fits_url = extract_fits_url(prod)
-                    
-                    # Stop if we have both
-                    if preview_url and fits_url:
-                        break
-                
-            except Exception as e:
-                # If we can't get products, skip this observation
-                skipped_count += 1
-                continue
-            
-            # Skip if no valid URLs found
-            if not preview_url and not fits_url:
-                skipped_count += 1
-                continue
-            
-            # Helper function to convert masked values to None
-            def clean_value(val):
-                """Convert masked/nan values to None for database compatibility"""
-                if val is None:
-                    return None
-                # Check if it's a masked value
-                if hasattr(val, 'mask') and val.mask:
-                    return None
-                # Convert numpy strings to regular strings
-                if hasattr(val, 'item'):
-                    return val.item()
-                return val
-            
-            # Prepare observation data with ALL fields (clean masked values)
-            obs_data = {
-                'obs_id': clean_value(obs_id),
-                'target_name': clean_value(row.get('target_name', '')),
-                'ra': float(row['s_ra']) if row.get('s_ra') else None,
-                'dec': float(row['s_dec']) if row.get('s_dec') else None,
-                'instrument': clean_value(row.get('instrument_name', '')),
-                'filter_name': clean_value(row.get('filters', '')),
-                'observation_date': obs_date,
-                'proposal_id': clean_value(row.get('proposal_id', '')),
-                'exposure_time': float(row['t_exptime']) if row.get('t_exptime') else None,
-                'description': clean_value(row.get('obs_title', '')),
-                # Metadata fields
-                'dataproduct_type': clean_value(row.get('dataproduct_type', '')),
-                'calib_level': int(row['calib_level']) if row.get('calib_level') else None,
-                'wavelength_region': clean_value(row.get('wavelength_region', '')),
-                'pi_name': clean_value(row.get('proposal_pi', '')),
-                'target_classification': clean_value(row.get('target_classification', '')),
-                # URLs
-                'preview_url': preview_url,
-                'fits_url': fits_url,
-                'updated_at': datetime.now(UTC)
-            }
-            
-            if existing:
-                # Update existing observation
-                for key, value in obs_data.items():
-                    setattr(existing, key, value)
-                updated_count += 1
-            else:
-                # Create new observation
-                new_obs = JWSTObservation(**obs_data)
-                db.add(new_obs)
-                added_count += 1
-            
-            # Commit every 10 observations to save progress
-            if (added_count + updated_count) % 10 == 0:
-                db.commit()
-                print(f"Progress: {added_count} added, {updated_count} updated, {skipped_count} skipped (processed {processed_count}/{len(obs_table)})")
-        
-        # Final commit
-        db.commit()
-        
-        print(f"\n✅ Fetch complete!")
-        print(f"   Added: {added_count} new observations")
-        print(f"   Updated: {updated_count} existing observations")
-        print(f"   Skipped: {skipped_count} (no valid URLs)")
-        print(f"   Total in database: {db.query(JWSTObservation).count()}")
-        print()
-        
-    except Exception as e:
-        print(f"❌ Error fetching data: {e}")
-        traceback.print_exc()
-        db.rollback()
-        raise
-    finally:
-        db.close()
+def fetch_public_jwst(limit=MAX_RESULTS):
+    print(f"\n🚀 Fetching up to {limit} PUBLIC JWST observations...\n")
 
+    # Fetch only public JWST observations - SIMPLE QUERY (fast!)
+    print("Querying MAST archive...")
+    obs_table = Observations.query_criteria(
+        obs_collection="JWST",
+        dataproduct_type=["image"],
+        calib_level=[2, 3],
+        dataRights="PUBLIC"
+    )[:limit * 3]  # Get 3x limit to scan for valid URLs
+
+    print(f"Found {len(obs_table)} observations to process.\n")
+
+    db = SessionLocal()
+    added = 0
+    updated = 0
+    processed = 0
+    skipped = 0
+
+    for obs in obs_table:
+        if added >= limit:
+            print(f"\nReached target of {limit} new observations. Stopping.")
+            break
+
+        processed += 1
+
+        obsid = clean_value(obs.get("obsid") or obs.get("obs_id"))
+        if not obsid:
+            skipped += 1
+            continue
+
+        # Retrieve product list for this observation
+        try:
+            products = Observations.get_product_list(obs)
+        except:
+            skipped += 1
+            continue
+
+        if len(products) == 0:
+            skipped += 1
+            continue
+
+        preview = None
+        fits = None
+
+        # Scan for best preview + FITS URLs
+        for prod in products:
+            if not preview:
+                preview = extract_preview_url(prod)
+            if not fits:
+                fits = extract_fits_url(prod)
+
+            if preview and fits:
+                break
+
+        # Must have at least preview or fits URL
+        if not preview and not fits:
+            skipped += 1
+            continue
+
+        # Check if exists
+        existing = db.query(JWSTObservation).filter_by(obs_id=obsid).first()
+
+        # Parse date
+        obs_date = None
+        if obs.get('t_min'):
+            try:
+                t = Time(obs['t_min'], format='mjd')
+                obs_date = t.datetime
+            except:
+                pass
+
+        # Prepare metadata (CLEAN all values to avoid masked constants)
+        metadata = {
+            "obs_id": obsid,
+            "target_name": clean_value(obs.get("target_name")),
+            "ra": float(obs.get("s_ra")) if obs.get("s_ra") else None,
+            "dec": float(obs.get("s_dec")) if obs.get("s_dec") else None,
+            "instrument": clean_value(obs.get("instrument_name")),
+            "filter_name": clean_value(obs.get("filters")),
+            "observation_date": obs_date,
+            "preview_url": preview,
+            "fits_url": fits,
+            "description": clean_value(obs.get("obs_title")),
+            "proposal_id": clean_value(str(obs.get("proposal_id")) if obs.get("proposal_id") else None),
+            "exposure_time": float(obs.get("t_exptime")) if obs.get("t_exptime") else None,
+            "dataproduct_type": clean_value(obs.get("dataproduct_type")),
+            "calib_level": int(obs.get("calib_level")) if obs.get("calib_level") else None,
+            "wavelength_region": clean_value(obs.get("wavelength_region")),
+            "pi_name": clean_value(obs.get("proposal_pi")),
+            "target_classification": clean_value(obs.get("target_classification")),
+            "updated_at": datetime.now(UTC),
+        }
+
+        if existing:
+            for k, v in metadata.items():
+                setattr(existing, k, v)
+            updated += 1
+        else:
+            obj = JWSTObservation(**metadata)
+            db.add(obj)
+            added += 1
+
+        if (added + updated) % 10 == 0:
+            db.commit()
+            print(f"Progress: {added} added, {updated} updated, {skipped} skipped (processed {processed})")
+
+    db.commit()
+    db.close()
+
+    print("\n✅ Fetch complete!")
+    print(f"   Added: {added}")
+    print(f"   Updated: {updated}")
+    print(f"   Skipped: {skipped}")
+    print(f"   Total processed: {processed}")
+    print()
+
+
+# -------------------------------------------------------
+# ENTRY POINT
+# -------------------------------------------------------
 
 if __name__ == "__main__":
-    # You can adjust max_results here
-    fetch_jwst_observations(max_results=50)
+    try:
+        init_db()
+        fetch_public_jwst()
+    except Exception as e:
+        print("❌ ERROR:")
+        traceback.print_exc()
+        sys.exit(1)
