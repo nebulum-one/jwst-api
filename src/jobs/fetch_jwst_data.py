@@ -11,6 +11,8 @@ import json
 import traceback
 from datetime import datetime, UTC
 from pathlib import Path
+import time
+from requests.exceptions import HTTPError, ConnectionError, Timeout
 
 from astroquery.mast import Observations
 from astropy.time import Time
@@ -164,7 +166,7 @@ def extract_fits_url(prod: dict) -> str | None:
 # -------------------------------------------------------
 
 def fetch_month(year_month: str, limit=MAX_RESULTS):
-    """Fetch JWST observations for a specific month"""
+    """Fetch JWST observations for a specific month with rate limiting and safer network handling"""
     
     print(f"\n📅 Processing: {year_month}")
     print("=" * 60)
@@ -206,10 +208,16 @@ def fetch_month(year_month: str, limit=MAX_RESULTS):
         # Check if exists
         existing = db.query(JWSTObservation).filter_by(obs_id=obsid).first()
 
-        # Get product list
+        # Get product list safely with rate limiting
         try:
             products = Observations.get_product_list(obs)
-        except:
+            time.sleep(0.25)  # small delay to avoid hitting MAST rate limits
+        except (HTTPError, ConnectionError, Timeout) as e:
+            print(f"⚠️ Network error for obs {obsid}: {e} - skipping")
+            skipped += 1
+            continue
+        except Exception as e:
+            print(f"⚠️ Unexpected error for obs {obsid}: {e} - skipping")
             skipped += 1
             continue
 
@@ -276,6 +284,10 @@ def fetch_month(year_month: str, limit=MAX_RESULTS):
         if (added + updated) % 25 == 0:
             db.commit()
             print(f"  Progress: {added} added, {updated} updated, {skipped} skipped ({processed}/{len(obs_table)})")
+            # Save mid-month progress to prevent loss
+            progress = load_progress()
+            progress["total_observations"] = db.query(JWSTObservation).count()
+            save_progress(progress)
 
     db.commit()
     db.close()
