@@ -202,6 +202,37 @@ async def get_spectra(
     }
 
 
+# IMPORTANT: /latest and /random MUST come BEFORE /{obs_id}
+@app.get("/observations/latest")
+async def get_latest_observations(
+    limit: int = Query(10, ge=1, le=50),
+    db: Session = Depends(get_db)
+):
+    """Get the most recent observations"""
+    observations = db.query(JWSTObservation).order_by(
+        desc(JWSTObservation.observation_date)
+    ).limit(limit).all()
+    
+    return {
+        "total": len(observations),
+        "results": [obs.to_dict() for obs in observations]
+    }
+
+
+@app.get("/observations/random")
+async def get_random_observation(db: Session = Depends(get_db)):
+    """Get a random observation"""
+    count = db.query(func.count(JWSTObservation.id)).scalar()
+    
+    if count == 0:
+        raise HTTPException(status_code=404, detail="No observations found in database")
+    
+    random_offset = random.randint(0, count - 1)
+    observation = db.query(JWSTObservation).offset(random_offset).first()
+    
+    return observation.to_dict()
+
+
 @app.get("/observations/search")
 async def search_observations(
     q: Optional[str] = Query(None, description="Search query for target name or description"),
@@ -365,6 +396,7 @@ async def search_by_date(
     }
 
 
+# IMPORTANT: This dynamic route MUST come AFTER all specific routes like /latest, /random, /search, etc.
 @app.get("/observations/{obs_id}")
 async def get_observation(obs_id: str, db: Session = Depends(get_db)):
     """Get a specific observation by ID"""
@@ -372,36 +404,6 @@ async def get_observation(obs_id: str, db: Session = Depends(get_db)):
     
     if not observation:
         raise HTTPException(status_code=404, detail="Observation not found")
-    
-    return observation.to_dict()
-
-
-@app.get("/observations/latest")
-async def get_latest_observations(
-    limit: int = Query(10, ge=1, le=50),
-    db: Session = Depends(get_db)
-):
-    """Get the most recent observations"""
-    observations = db.query(JWSTObservation).order_by(
-        desc(JWSTObservation.observation_date)
-    ).limit(limit).all()
-    
-    return {
-        "total": len(observations),
-        "results": [obs.to_dict() for obs in observations]
-    }
-
-
-@app.get("/observations/random")
-async def get_random_observation(db: Session = Depends(get_db)):
-    """Get a random observation"""
-    count = db.query(func.count(JWSTObservation.id)).scalar()
-    
-    if count == 0:
-        raise HTTPException(status_code=404, detail="No observations found in database")
-    
-    random_offset = random.randint(0, count - 1)
-    observation = db.query(JWSTObservation).offset(random_offset).first()
     
     return observation.to_dict()
 
