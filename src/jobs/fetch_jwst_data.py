@@ -185,24 +185,37 @@ def fetch_jwst_observations(max_results=MAX_RESULTS):
                 skipped_count += 1
                 continue
             
-            # Prepare observation data with ALL fields
+            # Helper function to convert masked values to None
+            def clean_value(val):
+                """Convert masked/nan values to None for database compatibility"""
+                if val is None:
+                    return None
+                # Check if it's a masked value
+                if hasattr(val, 'mask') and val.mask:
+                    return None
+                # Convert numpy strings to regular strings
+                if hasattr(val, 'item'):
+                    return val.item()
+                return val
+            
+            # Prepare observation data with ALL fields (clean masked values)
             obs_data = {
-                'obs_id': obs_id,
-                'target_name': row.get('target_name', ''),
+                'obs_id': clean_value(obs_id),
+                'target_name': clean_value(row.get('target_name', '')),
                 'ra': float(row['s_ra']) if row.get('s_ra') else None,
                 'dec': float(row['s_dec']) if row.get('s_dec') else None,
-                'instrument': row.get('instrument_name', ''),
-                'filter_name': row.get('filters', ''),
+                'instrument': clean_value(row.get('instrument_name', '')),
+                'filter_name': clean_value(row.get('filters', '')),
                 'observation_date': obs_date,
-                'proposal_id': row.get('proposal_id', ''),
+                'proposal_id': clean_value(row.get('proposal_id', '')),
                 'exposure_time': float(row['t_exptime']) if row.get('t_exptime') else None,
-                'description': row.get('obs_title', ''),
+                'description': clean_value(row.get('obs_title', '')),
                 # Metadata fields
-                'dataproduct_type': row.get('dataproduct_type', ''),
+                'dataproduct_type': clean_value(row.get('dataproduct_type', '')),
                 'calib_level': int(row['calib_level']) if row.get('calib_level') else None,
-                'wavelength_region': row.get('wavelength_region', ''),
-                'pi_name': row.get('proposal_pi', ''),
-                'target_classification': row.get('target_classification', ''),
+                'wavelength_region': clean_value(row.get('wavelength_region', '')),
+                'pi_name': clean_value(row.get('proposal_pi', '')),
+                'target_classification': clean_value(row.get('target_classification', '')),
                 # URLs
                 'preview_url': preview_url,
                 'fits_url': fits_url,
