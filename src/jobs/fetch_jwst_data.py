@@ -1,329 +1,224 @@
 """
-Fast, paginated JWST PUBLIC fetcher (observation-level pagination).
-
-Usage:
-    # default: limit=50, offset=0
-    python -m src.jobs.fetch_jwst_data
-
-    # custom
-    python -m src.jobs.fetch_jwst_data --limit 100 --offset 200
-
-Notes:
-- Batch commit size is defaulted to 20 (your current batch size).
-- The script will only process the requested slice (offset:offset+limit).
-- For each observation processed we fetch the product list and only store PUBLIC products.
+Fetch 50 PUBLIC JWST observations with valid preview + FITS URLs.
+Optimized for speed and reliable URL extraction.
 """
 
-from __future__ import annotations
-import argparse
 import sys
-import time
-from datetime import datetime, timezone
-from typing import Optional, Callable
+import traceback
+from datetime import datetime, UTC
 
 from astroquery.mast import Observations
-from astropy.time import Time
-import numpy as np
-
-# allow project imports when run as module
-import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+from sqlalchemy.orm import Session
 
 from src.db.database import SessionLocal, init_db
 from src.db.models import JWSTObservation
 
-# -------------------------
-# Configuration defaults
-# -------------------------
-DEFAULT_LIMIT = 50
-DEFAULT_OFFSET = 0
-BATCH_COMMIT = 20  # keep your current batch size
 
-# -------------------------
-# Utility helpers
-# -------------------------
+MAX_RESULTS = 50
 
-def safe_value(v):
-    """Convert numpy/Masked values to Python native or None."""
-    try:
-        if v is None:
-            return None
-        # numpy masked array
-        if isinstance(v, np.ma.MaskedArray):
-            if v.size == 0:
-                return None
-            if getattr(v, "mask", False).all():
-                return None
-            try:
-                return v.item()
-            except Exception:
-                arr = np.asarray(v)
-                # if scalar-like
-                if arr.size == 1:
-                    return arr.flatten()[0].item()
-                return arr.tolist()
-        # MaskedConstant
-        try:
-            from numpy.ma.core import MaskedConstant
-            if isinstance(v, MaskedConstant):
-                return None
-        except Exception:
-            pass
-    except Exception:
-        pass
 
-    # numpy scalar -> python scalar
-    try:
-        if isinstance(v, np.generic):
-            return v.item()
-    except Exception:
-        pass
+# -------------------------------------------------------
+# URL HELPERS
+# -------------------------------------------------------
 
-    return v
-
-def mast_uri_to_http(uri: Optional[str]) -> Optional[str]:
-    """Convert a mast: URI to HTTP download endpoint or return None."""
-    if not uri:
-        return None
-    uri = safe_value(uri)
-    if not isinstance(uri, str):
-        return None
-    if uri.startswith("mast:"):
-        return f"https://mast.stsci.edu/api/v0.1/Download/file?uri={uri}"
-    return uri
-
-def retry(func: Callable[[], any], retries: int = 5, backoff_factor: float = 2.0, initial_delay: float = 1.0):
-    """Generic retry wrapper with exponential backoff."""
-    delay = initial_delay
-    for attempt in range(1, retries + 1):
-        try:
-            return func()
-        except Exception as e:
-            if attempt == retries:
-                raise
-            print(f"⚠️ Attempt {attempt} failed: {e} — retrying in {delay:.1f}s")
-            time.sleep(delay)
-            delay *= backoff_factor
-
-def fetch_product_table_for_obs(obs_row):
-    """Fetch product list for an observation with retries."""
-    def _call():
-        return Observations.get_product_list(obs_row)
-    return retry(_call, retries=5, backoff_factor=2.0, initial_delay=1.0)
-
-def filter_public_products(product_table):
-    """Return list of rows from product_table where dataRights == 'PUBLIC'."""
-    public = []
-    try:
-        for p in product_table:
-            rights = safe_value(p.get("dataRights", None))
-            if isinstance(rights, str) and rights.strip().upper() == "PUBLIC":
-                public.append(p)
-    except Exception:
-        pass
-    return public
-
-def pick_preview_from_products(public_products):
-    """Pick a preview jpg/png (prefer productType == 'PREVIEW' then filename)."""
-    if not public_products:
+def mast_to_public_url(uri_or_path: str | None) -> str | None:
+    """Convert a mast:JWST/... or filename into a public HTTPS download URL."""
+    if not uri_or_path:
         return None
 
-    # prefer explicit productType PREVIEW
-    for p in public_products:
-        pt = safe_value(p.get("productType"))
-        if isinstance(pt, str) and pt.strip().upper() == "PREVIEW":
-            uri = safe_value(p.get("dataURI"))
-            http = mast_uri_to_http(uri)
-            if http:
-                return http
+    # Already an HTTPS URL
+    if uri_or_path.startswith("http"):
+        return uri_or_path
 
-    # filename-based jpg/png
-    for p in public_products:
-        fname = safe_value(p.get("productFilename"))
-        if isinstance(fname, str) and fname.lower().endswith((".jpg", ".jpeg", ".png")):
-            http = mast_uri_to_http(safe_value(p.get("dataURI")))
-            if http:
-                return http
+    # Convert mast: URIs
+    if uri_or_path.startswith("mast:"):
+        return f"https://mast.stsci.edu/api/v0.1/Download/file?uri={uri_or_path}"
 
-    # fallback: any image-like filename
-    for p in public_products:
-        fname = safe_value(p.get("productFilename"))
-        if isinstance(fname, str) and any(ext in fname.lower() for ext in (".jpg", ".jpeg", ".png", ".tif")):
-            http = mast_uri_to_http(safe_value(p.get("dataURI")))
-            if http:
-                return http
+    # Convert product filenames
+    # Example: jw01234...fits
+    if uri_or_path.lower().endswith((".fits", ".jpg", ".jpeg", ".png")):
+        return f"https://mast.stsci.edu/api/v0.1/Download/file?uri=mast:JWST/product/{uri_or_path}"
 
     return None
 
-def pick_fits_from_products(public_products):
-    """Pick first public FITS file (returns an HTTP URL)."""
-    if not public_products:
-        return None
-    for p in public_products:
-        fname = safe_value(p.get("productFilename"))
-        if isinstance(fname, str) and fname.lower().endswith(".fits"):
-            http = mast_uri_to_http(safe_value(p.get("dataURI")))
-            if http:
-                return http
+
+def extract_preview_url(prod: dict) -> str | None:
+    """Select best preview URL."""
+    # 1. Direct JPEG preview
+    if prod.get("jpegURL"):
+        return prod["jpegURL"]
+
+    # 2. PNG
+    if prod.get("pngURL"):
+        return prod["pngURL"]
+
+    # 3. Use dataURI if it's an image
+    uri = prod.get("dataURI")
+    if uri and prod.get("dataproduct_type") == "image":
+        return mast_to_public_url(uri)
+
+    # 4. Fallback to productFilename
+    filename = prod.get("productFilename")
+    if filename:
+        return mast_to_public_url(filename)
+
     return None
 
-def parse_mjd_to_datetime(mjd):
-    """Convert MJD to timezone-aware UTC datetime, or None."""
-    try:
-        if mjd is None:
-            return None
-        val = safe_value(mjd)
-        if val is None:
-            return None
-        dt = Time(val, format="mjd").to_datetime()
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except Exception:
-        return None
 
-# -------------------------
-# Main fetch function
-# -------------------------
+def extract_fits_url(prod: dict) -> str | None:
+    """Select best FITS file URL."""
 
-def fetch_jwst_observations(limit: int = DEFAULT_LIMIT, offset: int = DEFAULT_OFFSET, batch_commit: int = BATCH_COMMIT):
-    """
-    Fetch observations (observation-level pagination) and store only public products.
-    Only processes observations in range offset:offset+limit (fast).
-    """
-    print(f"\n🚀 Fetch start — limit={limit}, offset={offset}, batch_commit={batch_commit}")
+    # 1. dataURI
+    uri = prod.get("dataURI")
+    if uri and uri.lower().endswith(".fits"):
+        return mast_to_public_url(uri)
 
-    # Try to set ROW_LIMIT to avoid downloading entire catalog where supported
-    try:
-        Observations.ROW_LIMIT = offset + limit
-    except Exception:
-        # some versions may not support; ignore
-        pass
+    # 2. productFilename
+    filename = prod.get("productFilename")
+    if filename and filename.lower().endswith(".fits"):
+        return mast_to_public_url(filename)
 
-    init_db()
+    # 3. dataURL
+    if prod.get("dataURL"):
+        url = prod["dataURL"]
+        if url.lower().endswith(".fits"):
+            return url
+
+    # 4. s3_uris (rare)
+    s3 = prod.get("s3_uris")
+    if s3:
+        for uri in s3:
+            if uri.lower().endswith(".fits"):
+                return mast_to_public_url(uri)
+
+    return None
+
+
+# -------------------------------------------------------
+# MAIN FETCH LOGIC
+# -------------------------------------------------------
+
+def fetch_public_jwst(limit=MAX_RESULTS):
+    print(f"\n🚀 Fetching up to {limit} PUBLIC JWST observations...\n")
+
+    # Fetch only public JWST observations
+    obs_table = Observations.query_criteria(
+        obs_collection="JWST",
+        dataproduct_type=["image", "spectrum", "cube"],   # get all meaningful types
+        calib_level=[1, 2, 3],                            # all calibration levels
+        project="JWST",
+        filters=["PUBLIC"]
+    )
+
+    print(f"Found {len(obs_table)} raw entries (public).")
+
     db = SessionLocal()
+    added = 0
+    updated = 0
+    processed = 0
 
-    try:
-        # Main MAST query (we ask for public observation-level rows)
-        def _obs_query():
-            return Observations.query_criteria(
-                obs_collection="JWST",
-                dataproduct_type="image",
-                dataRights="PUBLIC",
-                calib_level=[2, 3],
-                # we avoid max_records because some astroquery versions warn it is unsupported
-            )
+    for obs in obs_table:
 
-        obs_table = retry(_obs_query, retries=5, backoff_factor=2.0, initial_delay=1.0)
+        if added >= limit:
+            break
 
-        if obs_table is None:
-            print("No observations returned.")
-            return
+        processed += 1
 
-        total_available = len(obs_table)
-        print(f"Found {total_available} observation-level PUBLIC entries.")
+        obsid = obs.get("obsid") or obs.get("obs_id")
+        if not obsid:
+            continue
 
-        # slice to requested window (fast mode)
-        start = int(offset)
-        end = int(offset + limit)
-        sliced = obs_table[start:end]
-        print(f"Processing {len(sliced)} observations (slice {start}:{end}).")
+        # ---------------------------------------------------
+        # Retrieve product list for this observation
+        # ---------------------------------------------------
+        products = Observations.get_product_list(obs)
+        if len(products) == 0:
+            continue
 
-        added = 0
-        updated = 0
-        processed = 0
+        preview = None
+        fits = None
 
-        for row in sliced:
-            processed += 1
-            # MAST sometimes uses 'obs_id' or 'obsid' naming; be resilient
-            obs_id = safe_value(row.get("obs_id") or row.get("obsid") or row.get("obs")) or None
-            if not obs_id:
-                # skip malformed row
-                continue
+        # Scan for best preview + FITS URLs
+        for prod in products:
+            if not preview:
+                preview = extract_preview_url(prod)
+            if not fits:
+                fits = extract_fits_url(prod)
 
-            # fetch product list for this observation (only for the current processed slice)
-            product_table = fetch_product_table_for_obs(row)
-            public_products = filter_public_products(product_table)
+            if preview and fits:
+                break
 
-            if not public_products:
-                # nothing public for this observation - skip it
-                print(f"  - {obs_id}: no PUBLIC products (skipped)")
-                continue
+        # Must have at least preview or fits URL to be useful
+        if not preview and not fits:
+            continue
 
-            preview_url = pick_preview_from_products(public_products)
-            fits_url = pick_fits_from_products(public_products)
+        # ---------------------------------------------------
+        # Insert or update DB row
+        # ---------------------------------------------------
+        existing: JWSTObservation = db.query(JWSTObservation).filter_by(obs_id=obsid).first()
 
-            # parse values safely
-            obs_date = parse_mjd_to_datetime(safe_value(row.get("t_min")))
-            ra = safe_value(row.get("s_ra"))
-            dec = safe_value(row.get("s_dec"))
+        def parse_date(val):
+            try:
+                return datetime.strptime(val, "%Y-%m-%dT%H:%M:%S.%f")
+            except:
+                try:
+                    return datetime.fromisoformat(val)
+                except:
+                    return None
 
-            obs_data = {
-                "obs_id": obs_id,
-                "target_name": safe_value(row.get("target_name")) or "",
-                "ra": float(ra) if ra is not None else None,
-                "dec": float(dec) if dec is not None else None,
-                "instrument": safe_value(row.get("instrument_name")) or "",
-                "filter_name": safe_value(row.get("filters")) or "",
-                "observation_date": obs_date,
-                "proposal_id": safe_value(row.get("proposal_id")) or "",
-                "exposure_time": float(safe_value(row.get("t_exptime"))) if safe_value(row.get("t_exptime")) is not None else None,
-                "description": safe_value(row.get("obs_title")) or "",
-                # metadata
-                "dataproduct_type": safe_value(row.get("dataproduct_type")),
-                "calib_level": int(safe_value(row.get("calib_level"))) if safe_value(row.get("calib_level")) is not None else None,
-                "wavelength_region": safe_value(row.get("wavelength_region")),
-                "pi_name": safe_value(row.get("proposal_pi")),
-                "target_classification": safe_value(row.get("target_classification")),
-                # Only public URLs
-                "preview_url": preview_url,
-                "fits_url": fits_url,
-            }
+        metadata = {
+            "obs_id": obsid,
+            "target_name": obs.get("target_name"),
+            "ra": obs.get("s_ra"),
+            "dec": obs.get("s_dec"),
+            "instrument": obs.get("instrument_name"),
+            "filter_name": obs.get("filter_name"),
+            "observation_date": parse_date(obs.get("t_min")),
+            "preview_url": preview,
+            "fits_url": fits,
+            "description": obs.get("intent", obs.get("description")),
+            "proposal_id": str(obs.get("proposal_id")),
+            "exposure_time": obs.get("t_exptime"),
+            "dataproduct_type": obs.get("dataproduct_type"),
+            "calib_level": obs.get("calib_level"),
+            "wavelength_region": obs.get("em_min") and obs.get("em_max"),
+            "pi_name": obs.get("proposal_pi"),
+            "target_classification": obs.get("target_classification"),
+            "updated_at": datetime.now(UTC),
+        }
 
-            # Insert or update
-            existing = db.query(JWSTObservation).filter(JWSTObservation.obs_id == obs_id).first()
-            if existing:
-                for k, v in obs_data.items():
-                    setattr(existing, k, v)
-                existing.updated_at = datetime.now(timezone.utc)
-                updated += 1
-            else:
-                db.add(JWSTObservation(**obs_data))
-                added += 1
+        if existing:
+            for k, v in metadata.items():
+                setattr(existing, k, v)
+            updated += 1
+        else:
+            obj = JWSTObservation(**metadata)
+            db.add(obj)
+            added += 1
 
-            # periodic commit
-            if (added + updated) % batch_commit == 0:
-                db.commit()
-                print(f"  Progress: processed={processed} added={added} updated={updated}")
+        if processed % 20 == 0:
+            print(f"  Progress: processed={processed} added={added} updated={updated}")
 
-        # final commit
-        db.commit()
-        total = db.query(JWSTObservation).count()
-        print("\n✅ Fetch complete")
-        print(f"   Added: {added}")
-        print(f"   Updated: {updated}")
-        print(f"   Total in DB: {total}\n")
+    db.commit()
+    db.close()
 
-    except Exception as exc:
-        print(f"❌ Fatal error during fetch: {exc}")
-        import traceback
-        traceback.print_exc()
-        db.rollback()
-        raise
-    finally:
-        db.close()
+    print("\n✅ Fetch complete!")
+    print(f"   Added: {added}")
+    print(f"   Updated: {updated}")
+    print(f"   Total processed: {processed}")
+    print("")
 
-# -------------------------
-# CLI
-# -------------------------
 
-def parse_cli():
-    p = argparse.ArgumentParser(description="Fetch JWST public observations into DB (paginated).")
-    p.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help="How many observations to process this run (default 50).")
-    p.add_argument("--offset", type=int, default=DEFAULT_OFFSET, help="Start index for observations (default 0).")
-    p.add_argument("--batch", type=int, default=BATCH_COMMIT, help="Batch commit size (default 20).")
-    return p.parse_args()
+# -------------------------------------------------------
+# ENTRY POINT
+# -------------------------------------------------------
 
 if __name__ == "__main__":
-    args = parse_cli()
-    fetch_jwst_observations(limit=args.limit, offset=args.offset, batch_commit=args.batch)
+    try:
+        init_db()
+        fetch_public_jwst()
+    except Exception as e:
+        print("❌ ERROR:")
+        traceback.print_exc()
+        sys.exit(1)
+
