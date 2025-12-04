@@ -34,7 +34,13 @@ class JWSTObservation(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     def to_dict(self):
-        """Convert model to dictionary"""
+        """Convert model to dictionary with MAST URL conversion"""
+        # Helper to convert MAST URIs
+        def convert_url(uri):
+            if uri and uri.startswith("mast:"):
+                return f"https://mast.stsci.edu/api/v0.1/Download/file?uri={uri}"
+            return uri
+        
         return {
             'id': self.id,
             'obs_id': self.obs_id,
@@ -46,8 +52,8 @@ class JWSTObservation(Base):
             'instrument': self.instrument,
             'filter': self.filter_name,
             'observation_date': self.observation_date.isoformat() if self.observation_date else None,
-            'preview_url': self.preview_url,
-            'fits_url': self.fits_url,
+            'preview_url': convert_url(self.preview_url),
+            'fits_url': convert_url(self.fits_url),
             'description': self.description,
             'proposal_id': self.proposal_id,
             'exposure_time': self.exposure_time,
@@ -58,3 +64,4 @@ class JWSTObservation(Base):
             'target_classification': self.target_classification,
             'created_at': self.created_at.isoformat() if self.created_at else None
         }
+    
