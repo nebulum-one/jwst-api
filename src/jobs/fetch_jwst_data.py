@@ -2,7 +2,9 @@
 JWST Data Fetcher with Smart Monthly Batch Processing
 Supports both IMAGE and SPECTRUM data with appropriate metadata.
 
-Usage: python src/jobs/fetch_jwst_data.py
+Usage: 
+  python src/jobs/fetch_jwst_data.py                    # Auto mode: process next incomplete month
+  python src/jobs/fetch_jwst_data.py --month 2026-01   # Manual mode: re-fetch specific month
 """
 
 import sys
@@ -359,6 +361,42 @@ def main():
     # Initialize database
     init_db()
     
+    # ========================================
+    # CHECK FOR COMMAND-LINE ARGUMENT
+    # ========================================
+    if len(sys.argv) > 2 and sys.argv[1] == "--month":
+        target_month = sys.argv[2]
+        print(f"\n🎯 MANUAL MODE: Re-processing {target_month}")
+        print("   (Will only add missing observations, skips duplicates)\n")
+        
+        try:
+            added, updated, skipped = fetch_month(target_month)
+            
+            # Get total count
+            db = SessionLocal()
+            total_obs = db.query(JWSTObservation).count()
+            db.close()
+            
+            # Summary
+            print("\n" + "=" * 60)
+            print(f"✅ {target_month} RE-FETCH COMPLETE!")
+            print("=" * 60)
+            print(f"   Added: {added} new observations")
+            print(f"   Skipped: {skipped} (already in database)")
+            print(f"   Total in database: {total_obs:,}")
+            print("=" * 60 + "\n")
+            
+        except Exception as e:
+            print(f"\n❌ ERROR processing {target_month}:")
+            traceback.print_exc()
+            sys.exit(1)
+        
+        return
+    
+    # ========================================
+    # AUTO MODE - Process next incomplete month
+    # ========================================
+    
     # Load progress
     progress = load_progress()
     
@@ -374,7 +412,9 @@ def main():
     
     if not next_month:
         print("\n🎉 ALL MONTHS COMPLETED! Your database is fully backfilled!")
-        print(f"📚 Total observations: {progress.get('total_observations', 0)}")
+        print(f"📚 Total observations: {progress.get('total_observations', 0):,}")
+        print("\n💡 To re-fetch a specific month (to fill gaps), use:")
+        print("   python src/jobs/fetch_jwst_data.py --month YYYY-MM")
         return
     
     print(f"📅 Next month to process: {next_month}")
@@ -405,7 +445,7 @@ def main():
         print(f"   Added: {added} new observations")
         print(f"   Updated: {updated} existing observations")
         print(f"   Skipped: {skipped} (already in database or no valid URLs)")
-        print(f"   Total in database: {total_obs}")
+        print(f"   Total in database: {total_obs:,}")
         print()
         print(f"📊 Overall Progress: {len(progress['completed_months'])}/{len(all_months)} months ({len(progress['completed_months'])/len(all_months)*100:.1f}%)")
         
